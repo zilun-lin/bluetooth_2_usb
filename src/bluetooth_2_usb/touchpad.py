@@ -63,6 +63,11 @@ def _build_finger_collection() -> bytes:
         0x46, 0x7E, 0x04,  #     Physical Maximum (1150 = 11.50 cm)
         0x81, 0x02,        #     Input (Data, Variable, Absolute)
 
+        # Reset global items so they don't leak into subsequent fields
+        0x55, 0x00,        #     Unit Exponent (0)
+        0x65, 0x00,        #     Unit (None)
+        0x45, 0x00,        #     Physical Maximum (0) - undefined
+
         # End Finger collection
         0x05, 0x0D,        #     Usage Page (Digitizer) - restore for next finger
         0xC0,              #   End Collection

@@ -756,9 +756,9 @@ class UdevEventMonitor:
     def __init__(self, relay_controller: RelayController) -> None:
         """
         :param relay_controller: The RelayController to add/remove devices
-        :param loop: The asyncio event loop
         """
         self.relay_controller = relay_controller
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         self.context = pyudev.Context()
         self.monitor = pyudev.Monitor.from_netlink(self.context)
@@ -769,6 +769,7 @@ class UdevEventMonitor:
         """
         Async context manager entry. Starts the pyudev monitor observer.
         """
+        self._loop = asyncio.get_running_loop()
         self.observer.start()
         _logger.debug("UdevEventMonitor started observer.")
         return self
@@ -783,7 +784,8 @@ class UdevEventMonitor:
 
     def _udev_event_callback(self, action: str, device: pyudev.Device) -> None:
         """
-        pyudev callback for input devices.
+        pyudev callback for input devices. Runs in the observer thread,
+        so we schedule work on the asyncio event loop via call_soon_threadsafe.
 
         :param action: "add" or "remove"
         :param device: The pyudev device
@@ -792,9 +794,16 @@ class UdevEventMonitor:
         if not device_node or not device_node.startswith("/dev/input/event"):
             return
 
-        if action == "add":
-            _logger.debug(f"UdevEventMonitor: Added input => {device_node}")
-            self.relay_controller.add_device(device_node)
-        elif action == "remove":
-            _logger.debug(f"UdevEventMonitor: Removed input => {device_node}")
-            self.relay_controller.remove_device(device_node)
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+
+        try:
+            if action == "add":
+                _logger.debug(f"UdevEventMonitor: Added input => {device_node}")
+                loop.call_soon_threadsafe(self.relay_controller.add_device, device_node)
+            elif action == "remove":
+                _logger.debug(f"UdevEventMonitor: Removed input => {device_node}")
+                loop.call_soon_threadsafe(self.relay_controller.remove_device, device_node)
+        except RuntimeError:
+            pass
