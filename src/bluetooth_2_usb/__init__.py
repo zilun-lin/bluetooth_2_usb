@@ -23,5 +23,6 @@ from .touchpad import (
     TOUCHPAD_DEVICE,
     MultitouchState,
     TouchpadGadget,
+    initialize_feature_report,
     is_multitouch_device,
 )

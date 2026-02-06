@@ -1,3 +1,5 @@
+import fcntl
+import struct
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -12,10 +14,12 @@ _logger = get_logger()
 
 MAX_CONTACTS = 5
 TOUCHPAD_REPORT_ID = 0x04
+FEATURE_REPORT_ID = 0x05
 LOGICAL_MAX = 32767
-# Per-contact: 1 (tip+pad) + 1 (id) + 2 (X) + 2 (Y) = 6 bytes
+# Per-contact: 1 (confidence+tip+pad) + 1 (id) + 2 (X) + 2 (Y) = 6 bytes
 # Total: 5*6 + 1 (count) + 1 (button+pad) = 32 bytes
 IN_REPORT_LENGTH = MAX_CONTACTS * 6 + 2
+FEATURE_REPORT_LENGTH = 1  # 1 byte for Contact Count Maximum
 
 
 def _build_finger_collection() -> bytes:
@@ -24,16 +28,20 @@ def _build_finger_collection() -> bytes:
         0x09, 0x22,        #   Usage (Finger)
         0xA1, 0x02,        #   Collection (Logical)
 
-        # Tip Switch (1 bit)
-        0x09, 0x42,        #     Usage (Tip Switch)
+        # Confidence (1 bit)
+        0x09, 0x47,        #     Usage (Confidence)
         0x15, 0x00,        #     Logical Minimum (0)
         0x25, 0x01,        #     Logical Maximum (1)
         0x75, 0x01,        #     Report Size (1)
         0x95, 0x01,        #     Report Count (1)
         0x81, 0x02,        #     Input (Data, Variable, Absolute)
 
-        # Padding (7 bits)
-        0x75, 0x07,        #     Report Size (7)
+        # Tip Switch (1 bit)
+        0x09, 0x42,        #     Usage (Tip Switch)
+        0x81, 0x02,        #     Input (Data, Variable, Absolute)
+
+        # Padding (6 bits)
+        0x75, 0x06,        #     Report Size (6)
         0x95, 0x01,        #     Report Count (1)
         0x81, 0x03,        #     Input (Constant)
 
@@ -110,6 +118,19 @@ def _build_touchpad_descriptor() -> bytes:
         0x75, 0x07,        #   Report Size (7)
         0x95, 0x01,        #   Report Count (1)
         0x81, 0x03,        #   Input (Constant)
+
+        # Contact Count Maximum - Feature Report (Constant)
+        # Declared as Constant so the host reads the value from the
+        # descriptor (Logical Min = Max = MAX_CONTACTS) rather than
+        # issuing GET_REPORT (which f_hid fills with zeros on kernel < 6.12).
+        0x05, 0x0D,        #   Usage Page (Digitizer)
+        0x09, 0x55,        #   Usage (Contact Count Maximum)
+        0x85, FEATURE_REPORT_ID,  # Report ID (5)
+        0x15, MAX_CONTACTS, #  Logical Minimum (5)
+        0x25, MAX_CONTACTS, #  Logical Maximum (5)
+        0x75, 0x08,        #   Report Size (8)
+        0x95, 0x01,        #   Report Count (1)
+        0xB1, 0x03,        #   Feature (Constant, Variable, Absolute)
 
         0xC0,              # End Collection
     ))
@@ -317,7 +338,7 @@ class TouchpadGadget:
             slot = state.slots[i]
 
             if slot.active:
-                report[offset] = 0x01
+                report[offset] = 0x03  # Confidence (bit 0) + Tip Switch (bit 1)
                 report[offset + 1] = i
                 x = state.scale_x(slot.x)
                 y = state.scale_y(slot.y)
@@ -344,3 +365,41 @@ class TouchpadGadget:
         for i in range(len(self._report)):
             self._report[i] = 0
         self._device.send_report(self._report, TOUCHPAD_REPORT_ID)
+
+
+def initialize_feature_report(hidg_path: str) -> None:
+    """
+    Pre-populate the GET_REPORT response for the Contact Count Maximum
+    feature report on the given /dev/hidg* device.
+
+    Requires Linux kernel >= 6.12 with GADGET_HID_WRITE_GET_REPORT ioctl.
+    On older kernels this is a no-op (the Constant descriptor declaration
+    is the primary mechanism for communicating Contact Count Maximum).
+
+    :param hidg_path: Path to the HID gadget device (e.g. /dev/hidg3)
+    """
+    # GADGET_HID_WRITE_GET_REPORT = _IOW('g', 0x42, struct usb_hidg_report)
+    # struct usb_hidg_report { u8 report_id; u8 userspace_req; u16 length;
+    #                          u8 data[64]; u8 padding[4]; }  = 72 bytes
+    GADGET_HID_WRITE_GET_REPORT = 0x40486742
+
+    # Pack: report_id=5, userspace_req=0 (pre-populate, don't wait for poll),
+    #       length=1, data[0]=MAX_CONTACTS, rest zeros
+    data = bytearray(72)
+    data[0] = FEATURE_REPORT_ID       # report_id
+    data[1] = 0x00                     # userspace_req = false (pre-populate)
+    struct.pack_into("<H", data, 2, FEATURE_REPORT_LENGTH)  # length = 1
+    data[4] = MAX_CONTACTS             # data[0] = Contact Count Maximum = 5
+
+    try:
+        with open(hidg_path, "rb") as fd:
+            fcntl.ioctl(fd, GADGET_HID_WRITE_GET_REPORT, bytes(data))
+        _logger.info(
+            f"Feature report pre-populated on {hidg_path}: "
+            f"Contact Count Maximum = {MAX_CONTACTS}"
+        )
+    except OSError:
+        _logger.debug(
+            f"GADGET_HID_WRITE_GET_REPORT not supported on {hidg_path} "
+            f"(kernel < 6.12). Relying on Constant descriptor declaration."
+        )

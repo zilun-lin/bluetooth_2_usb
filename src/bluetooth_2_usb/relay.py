@@ -25,6 +25,7 @@ from .touchpad import (
     TOUCHPAD_DEVICE,
     MultitouchState,
     TouchpadGadget,
+    initialize_feature_report,
     is_multitouch_device,
 )
 
@@ -71,6 +72,15 @@ class GadgetManager:
         self._enabled = True
 
         _logger.debug(f"USB HID gadgets re-initialized: {enabled_devices}")
+
+        # Try to pre-populate the touchpad Feature Report (Contact Count Maximum)
+        # via ioctl. Works on kernel >= 6.12; harmless no-op on older kernels.
+        for dev in enabled_devices:
+            if getattr(dev, "usage_page", None) == 0x0D and getattr(dev, "usage", None) == 0x05:
+                hidg_path = getattr(dev, "path", None)
+                if hidg_path:
+                    initialize_feature_report(hidg_path)
+                break
 
     def get_keyboard(self) -> Optional[Keyboard]:
         """
