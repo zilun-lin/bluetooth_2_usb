@@ -19,3 +19,9 @@ from .relay import (
     RelayController,
     async_list_input_devices,
 )
+from .touchpad import (
+    TOUCHPAD_DEVICE,
+    MultitouchState,
+    TouchpadGadget,
+    is_multitouch_device,
+)

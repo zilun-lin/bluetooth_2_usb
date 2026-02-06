@@ -13,6 +13,7 @@ import usb_hid
 from usb_hid import Device
 
 from .evdev import (
+    ecodes,
     evdev_to_usb_hid,
     find_key_name,
     get_mouse_movement,
@@ -20,6 +21,12 @@ from .evdev import (
     is_mouse_button,
 )
 from .logging import get_logger
+from .touchpad import (
+    TOUCHPAD_DEVICE,
+    MultitouchState,
+    TouchpadGadget,
+    is_multitouch_device,
+)
 
 _logger = get_logger()
 
@@ -40,6 +47,7 @@ class GadgetManager:
             "keyboard": None,
             "mouse": None,
             "consumer": None,
+            "touchpad": None,
         }
         self._enabled = False
 
@@ -53,12 +61,13 @@ class GadgetManager:
         except Exception as ex:
             _logger.debug(f"usb_hid.disable() failed or was already disabled: {ex}")
 
-        usb_hid.enable([Device.BOOT_MOUSE, Device.KEYBOARD, Device.CONSUMER_CONTROL])  # type: ignore
+        usb_hid.enable([Device.BOOT_MOUSE, Device.KEYBOARD, Device.CONSUMER_CONTROL, TOUCHPAD_DEVICE])  # type: ignore
         enabled_devices = list(usb_hid.devices)  # type: ignore
 
         self._gadgets["keyboard"] = Keyboard(enabled_devices)
         self._gadgets["mouse"] = Mouse(enabled_devices)
         self._gadgets["consumer"] = ConsumerControl(enabled_devices)
+        self._gadgets["touchpad"] = TouchpadGadget(enabled_devices)
         self._enabled = True
 
         _logger.debug(f"USB HID gadgets re-initialized: {enabled_devices}")
@@ -89,6 +98,15 @@ class GadgetManager:
         :rtype: ConsumerControl | None
         """
         return self._gadgets["consumer"]
+
+    def get_touchpad(self) -> Optional[TouchpadGadget]:
+        """
+        Get the TouchpadGadget.
+
+        :return: A TouchpadGadget object, or None if not initialized
+        :rtype: TouchpadGadget | None
+        """
+        return self._gadgets["touchpad"]
 
 
 class ShortcutToggler:
@@ -139,10 +157,13 @@ class ShortcutToggler:
         if self.relaying_active.is_set():
             keyboard = self.gadget_manager.get_keyboard()
             mouse = self.gadget_manager.get_mouse()
+            touchpad = self.gadget_manager.get_touchpad()
             if keyboard:
                 keyboard.release_all()
             if mouse:
                 mouse.release_all()
+            if touchpad:
+                touchpad.release_all()
 
             self.currently_pressed.clear()
             self.relaying_active.clear()
@@ -333,6 +354,11 @@ class DeviceRelay:
 
         self._currently_grabbed = False
 
+        self._multitouch_state: Optional[MultitouchState] = None
+        if is_multitouch_device(input_device):
+            self._multitouch_state = MultitouchState(input_device)
+            _logger.info(f"Multitouch device detected: {input_device.name}")
+
     def __str__(self) -> str:
         return f"relay for {self._input_device}"
 
@@ -382,15 +408,11 @@ class DeviceRelay:
         :return: None
         """
         async for input_event in self._input_device.async_read_loop():
-            event = categorize(input_event)
-
-            if any(isinstance(event, ev_type) for ev_type in [KeyEvent, RelEvent]):
-                _logger.debug(
-                    f"Received {event} from {self._input_device.name} ({self._input_device.path})"
-                )
-
-            if self._shortcut_toggler and isinstance(event, KeyEvent):
-                self._shortcut_toggler.handle_key_event(event)
+            # For key events, always pass to shortcut toggler regardless of device type
+            if input_event.type == ecodes.EV_KEY and self._shortcut_toggler:
+                key_event = categorize(input_event)
+                if isinstance(key_event, KeyEvent):
+                    self._shortcut_toggler.handle_key_event(key_event)
 
             active = self._relaying_active and self._relaying_active.is_set()
 
@@ -414,7 +436,17 @@ class DeviceRelay:
             if not active:
                 continue
 
-            await self._process_event_with_retry(event)
+            # Multitouch devices: route raw events to the state machine
+            if self._multitouch_state is not None:
+                await self._process_multitouch_event(input_event)
+            else:
+                # Standard keyboard/mouse path
+                event = categorize(input_event)
+                if any(isinstance(event, ev_type) for ev_type in [KeyEvent, RelEvent]):
+                    _logger.debug(
+                        f"Received {event} from {self._input_device.name} ({self._input_device.path})"
+                    )
+                await self._process_event_with_retry(event)
 
     async def _process_event_with_retry(self, event: InputEvent) -> None:
         """
@@ -446,6 +478,54 @@ class DeviceRelay:
                 return
             except Exception:
                 _logger.exception(f"Error processing {event}")
+                return
+
+    async def _process_multitouch_event(self, input_event: InputEvent) -> None:
+        """
+        Feed a raw InputEvent into the multitouch state machine.
+        On SYN_REPORT (frame complete), send the accumulated touchpad HID report.
+
+        :param input_event: The raw evdev InputEvent
+        """
+        frame_complete = self._multitouch_state.process_event(input_event)
+        if frame_complete:
+            _logger.debug(
+                f"Touchpad frame: {self._multitouch_state.contact_count} contacts, "
+                f"button={'down' if self._multitouch_state.button_left else 'up'}"
+            )
+            await self._send_touchpad_report_with_retry()
+
+    async def _send_touchpad_report_with_retry(self) -> None:
+        """
+        Send the current touchpad HID report with retry on BlockingIOError.
+        """
+        touchpad = self._gadget_manager.get_touchpad()
+        if touchpad is None:
+            return
+
+        max_tries = 3
+        retry_delay = 0.1
+        for attempt in range(1, max_tries + 1):
+            try:
+                touchpad.send_report(self._multitouch_state)
+                return
+            except BlockingIOError:
+                if attempt < max_tries:
+                    _logger.debug(f"Touchpad HID write blocked ({attempt}/{max_tries})")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    _logger.warning(f"Touchpad HID write blocked ({attempt}/{max_tries})")
+            except BrokenPipeError:
+                _logger.warning(
+                    "BrokenPipeError on touchpad: USB cable likely disconnected or power-only. "
+                    "Pausing relay.\nSee: "
+                    "https://github.com/quaxalber/bluetooth_2_usb?tab=readme-ov-file#7-troubleshooting"
+                )
+                if self._relaying_active:
+                    self._relaying_active.clear()
+                return
+            except Exception:
+                _logger.exception("Error sending touchpad report")
                 return
 
 
