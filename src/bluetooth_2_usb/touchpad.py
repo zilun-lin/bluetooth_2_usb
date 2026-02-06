@@ -121,6 +121,7 @@ TOUCHPAD_DEVICE = Device(
     report_ids=(TOUCHPAD_REPORT_ID,),
     in_report_lengths=(IN_REPORT_LENGTH,),
     out_report_lengths=(0,),
+    name="touchpad",
 )
 
 
